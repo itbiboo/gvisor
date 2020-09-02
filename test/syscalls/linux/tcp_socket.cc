@@ -38,6 +38,9 @@
 namespace gvisor {
 namespace testing {
 
+using ::testing::AnyOf;
+using ::testing::Eq;
+
 namespace {
 
 PosixErrorOr<sockaddr_storage> InetLoopbackAddr(int family) {
@@ -870,30 +873,95 @@ TEST_P(TcpSocketTest, PollAfterShutdown) {
               SyscallSucceedsWithValue(1));
 }
 
-TEST_P(SimpleTcpSocketTest, NonBlockingConnectNoListener) {
+TEST_P(SimpleTcpSocketTest, NonBlockingConnectRetry) {
+  const FileDescriptor listener =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
   // Initialize address to the loopback one.
   sockaddr_storage addr =
       ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
   socklen_t addrlen = sizeof(addr);
 
-  const FileDescriptor s =
+  // Bind to some port but don't listen yet.
+  ASSERT_THAT(
+      bind(listener.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+      SyscallSucceeds());
+
+  // Get the address we're bound to, then connect to it. We need to do this
+  // because we're allowing the stack to pick a port for us.
+  ASSERT_THAT(getsockname(listener.get(),
+                          reinterpret_cast<struct sockaddr*>(&addr), &addrlen),
+              SyscallSucceeds());
+
+  FileDescriptor connector =
       ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  // Verify that connect fails.
+  ASSERT_THAT(
+      RetryEINTR(connect)(connector.get(),
+                          reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+      SyscallFailsWithErrno(ECONNREFUSED));
+
+  // Now start listening
+  ASSERT_THAT(listen(listener.get(), SOMAXCONN), SyscallSucceeds());
+
+  // TODO(gvisor.dev/issue/3828): Issuing connect() again on a socket that
+  //   failed first connect should succeed.
+  if (IsRunningOnGvisor()) {
+    ASSERT_THAT(
+        RetryEINTR(connect)(connector.get(),
+                            reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+        SyscallFailsWithErrno(ECONNABORTED));
+    return;
+  }
+
+  // Verify that connect now succeeds.
+  ASSERT_THAT(
+      RetryEINTR(connect)(connector.get(),
+                          reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+      SyscallSucceeds());
+
+  // Accept the connection.
+  int accepted;
+  ASSERT_THAT(accepted = RetryEINTR(accept)(listener.get(), nullptr, nullptr),
+              SyscallSucceeds());
+  close(accepted);
+}
+
+// nonBlockingConnectNoListener returns a non-blocking file descriptor to a
+// socket on which a connect that is expected to fail has been issued.
+PosixErrorOr<FileDescriptor> nonBlockingConnectNoListener(const int family,
+                                                          sockaddr_storage addr,
+                                                          socklen_t addrlen) {
+  int s;
+  RETURN_ERROR_IF_SYSCALL_FAIL(s = socket(family, SOCK_STREAM, IPPROTO_TCP));
 
   // Set the FD to O_NONBLOCK.
   int opts;
-  ASSERT_THAT(opts = fcntl(s.get(), F_GETFL), SyscallSucceeds());
+  RETURN_ERROR_IF_SYSCALL_FAIL(opts = fcntl(s, F_GETFL));
   opts |= O_NONBLOCK;
-  ASSERT_THAT(fcntl(s.get(), F_SETFL, opts), SyscallSucceeds());
+  RETURN_ERROR_IF_SYSCALL_FAIL(fcntl(s, F_SETFL, opts));
 
-  ASSERT_THAT(RetryEINTR(connect)(
-                  s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+  EXPECT_THAT(RetryEINTR(connect)(s, reinterpret_cast<struct sockaddr*>(&addr),
+                                  addrlen),
               SyscallFailsWithErrno(EINPROGRESS));
 
   // Now polling on the FD with a timeout should return 0 corresponding to no
   // FDs ready.
-  struct pollfd poll_fd = {s.get(), POLLOUT, 0};
+  struct pollfd poll_fd = {s, POLLOUT, 0};
   EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, 10000),
               SyscallSucceedsWithValue(1));
+  return FileDescriptor(s);
+}
+
+TEST_P(SimpleTcpSocketTest, NonBlockingConnectNoListener) {
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+
+  // Initialize address to the loopback one.
+  const FileDescriptor s =
+      nonBlockingConnectNoListener(GetParam(), addr, addrlen).ValueOrDie();
 
   int err;
   socklen_t optlen = sizeof(err);
@@ -901,6 +969,51 @@ TEST_P(SimpleTcpSocketTest, NonBlockingConnectNoListener) {
               SyscallSucceeds());
 
   EXPECT_EQ(err, ECONNREFUSED);
+  char c;
+  ASSERT_THAT(read(s.get(), &c, 1), SyscallSucceeds());
+  int opts;
+  EXPECT_THAT(opts = fcntl(s.get(), F_GETFL), SyscallSucceeds());
+  opts &= ~O_NONBLOCK;
+  EXPECT_THAT(fcntl(s.get(), F_SETFL, opts), SyscallSucceeds());
+  // Try connecting again.
+  ASSERT_THAT(RetryEINTR(connect)(
+                  s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+              SyscallFailsWithErrno(ECONNABORTED));
+}
+
+TEST_P(SimpleTcpSocketTest, NonBlockingConnectNoListenerRead) {
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+
+  // Initialize address to the loopback one.
+  const FileDescriptor s =
+      nonBlockingConnectNoListener(GetParam(), addr, addrlen).ValueOrDie();
+
+  unsigned char c;
+  ASSERT_THAT(read(s.get(), &c, 1), SyscallFailsWithErrno(ECONNREFUSED));
+  ASSERT_THAT(read(s.get(), &c, 1), SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR(connect)(
+                  s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+              SyscallFailsWithErrno(ECONNABORTED));
+}
+
+TEST_P(SimpleTcpSocketTest, NonBlockingConnectNoListenerPeek) {
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+
+  // Initialize address to the loopback one.
+  const FileDescriptor s =
+      nonBlockingConnectNoListener(GetParam(), addr, addrlen).ValueOrDie();
+
+  unsigned char c;
+  ASSERT_THAT(recv(s.get(), &c, 1, MSG_PEEK),
+              SyscallFailsWithErrno(ECONNREFUSED));
+  ASSERT_THAT(recv(s.get(), &c, 1, MSG_PEEK), SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR(connect)(
+                  s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+              SyscallFailsWithErrno(ECONNABORTED));
 }
 
 TEST_P(SimpleTcpSocketTest, SelfConnectSendRecv_NoRandomSave) {
@@ -1141,10 +1254,16 @@ TEST_P(SimpleTcpSocketTest, CleanupOnConnectionRefused) {
 
   // Attempt #2, with the new socket and reused addr our connect should fail in
   // the same way as before, not with an EADDRINUSE.
+  //
+  // TODO(gvisor.dev/issue/3828): 2nd connect on a socket which failed connect
+  //   first time should succeed.
+  // gVisor never issues the second connect and returns ECONNABORTED instead.
+  // Linux actually sends a SYN again and gets a RST and correctly returns
+  // ECONNREFUSED.
   ASSERT_THAT(connect(client_s.get(),
                       reinterpret_cast<const struct sockaddr*>(&bound_addr),
                       bound_addrlen),
-              SyscallFailsWithErrno(ECONNREFUSED));
+              SyscallFailsWithErrno(AnyOf(Eq(ECONNREFUSED), Eq(ECONNABORTED))));
 }
 
 // Test that we get an ECONNREFUSED with a nonblocking socket.

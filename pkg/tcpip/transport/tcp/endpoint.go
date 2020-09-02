@@ -1273,11 +1273,24 @@ func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
 	e.owner = owner
 }
 
+// Preconditions: e.mu must be held to call this function.
+func (e *endpoint) hardErrorLocked() *tcpip.Error {
+	err := e.HardError
+	e.HardError = nil
+	return err
+}
+
 func (e *endpoint) LastError() *tcpip.Error {
+	e.LockUser()
+	defer e.UnlockUser()
+	err := e.hardErrorLocked()
+	if err != nil {
+		return err
+	}
 	e.lastErrorMu.Lock()
-	defer e.lastErrorMu.Unlock()
-	err := e.lastError
+	err = e.lastError
 	e.lastError = nil
+	e.lastErrorMu.Unlock()
 	return err
 }
 
@@ -1302,9 +1315,8 @@ func (e *endpoint) Read(*tcpip.FullAddress) (buffer.View, tcpip.ControlMessages,
 	bufUsed := e.rcvBufUsed
 	if s := e.EndpointState(); !s.connected() && s != StateClose && bufUsed == 0 {
 		e.rcvListMu.Unlock()
-		he := e.HardError
 		if s == StateError {
-			return buffer.View{}, tcpip.ControlMessages{}, he
+			return buffer.View{}, tcpip.ControlMessages{}, e.hardErrorLocked()
 		}
 		e.stats.ReadErrors.NotConnected.Increment()
 		return buffer.View{}, tcpip.ControlMessages{}, tcpip.ErrNotConnected
@@ -1360,9 +1372,12 @@ func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
 // indicating the reason why it's not writable.
 // Caller must hold e.mu and e.sndBufMu
 func (e *endpoint) isEndpointWritableLocked() (int, *tcpip.Error) {
+	// The endpoint cannot be written to if it's not connected.
 	switch s := e.EndpointState(); {
 	case s == StateError:
-		return 0, e.HardError
+		if err := e.hardErrorLocked(); err != nil {
+			return 0, err
+		}
 	case !s.connecting() && !s.connected():
 		return 0, tcpip.ErrClosedForSend
 	case s.connecting():
@@ -1476,7 +1491,7 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 	// but has some pending unread data.
 	if s := e.EndpointState(); !s.connected() && s != StateClose {
 		if s == StateError {
-			return 0, tcpip.ControlMessages{}, e.HardError
+			return 0, tcpip.ControlMessages{}, e.hardErrorLocked()
 		}
 		e.stats.ReadErrors.InvalidEndpointState.Increment()
 		return 0, tcpip.ControlMessages{}, tcpip.ErrInvalidEndpointState
@@ -2241,7 +2256,10 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 		return tcpip.ErrAlreadyConnecting
 
 	case StateError:
-		return e.HardError
+		if err := e.hardErrorLocked(); err != nil {
+			return err
+		}
+		return tcpip.ErrConnectionAborted
 
 	default:
 		return tcpip.ErrInvalidEndpointState
