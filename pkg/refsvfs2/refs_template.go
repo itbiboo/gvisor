@@ -26,6 +26,12 @@ import (
 	"gvisor.dev/gvisor/pkg/refsvfs2"
 )
 
+// logTrace indicates whether reference-related events should be logged (with
+// stack traces). This is false by default and should only be set to true for
+// debugging purposes, as it can generate an extremely large amount of output
+// and drastically degrade performance.
+const logTrace = false
+
 // T is the type of the reference counted object. It is only used to customize
 // debug output when leak checking.
 type T interface{}
@@ -55,13 +61,13 @@ type Refs struct {
 // EnableLeakCheck enables reference leak checking on r.
 func (r *Refs) EnableLeakCheck() {
 	if refsvfs2.LeakCheckEnabled() {
-		refsvfs2.Register(r, fmt.Sprintf("%T", ownerType))
+		refsvfs2.Register(r, fmt.Sprintf("%T", ownerType), logTrace)
 	}
 }
 
 // LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
 func (r *Refs) LeakMessage() string {
-	return fmt.Sprintf("%T %p: reference count of %d instead of 0", ownerType, r, r.ReadRefs())
+	return fmt.Sprintf("[%T %p] reference count of %d instead of 0", ownerType, r, r.ReadRefs())
 }
 
 // ReadRefs returns the current number of references. The returned count is
@@ -75,7 +81,11 @@ func (r *Refs) ReadRefs() int64 {
 //
 //go:nosplit
 func (r *Refs) IncRef() {
-	if v := atomic.AddInt64(&r.refCount, 1); v <= 0 {
+	v := atomic.AddInt64(&r.refCount, 1)
+	if logTrace {
+		r.logEvent(fmt.Sprintf("IncRef to %d", v+1))
+	}
+	if v <= 0 {
 		panic(fmt.Sprintf("Incrementing non-positive count %p on %T", r, ownerType))
 	}
 }
@@ -89,15 +99,17 @@ func (r *Refs) IncRef() {
 //go:nosplit
 func (r *Refs) TryIncRef() bool {
 	const speculativeRef = 1 << 32
-	v := atomic.AddInt64(&r.refCount, speculativeRef)
-	if int32(v) < 0 {
+	if v := atomic.AddInt64(&r.refCount, speculativeRef); int32(v) < 0 {
 		// This object has already been freed.
 		atomic.AddInt64(&r.refCount, -speculativeRef)
 		return false
 	}
 
 	// Turn into a real reference.
-	atomic.AddInt64(&r.refCount, -speculativeRef+1)
+	v := atomic.AddInt64(&r.refCount, -speculativeRef+1)
+	if logTrace {
+		r.logEvent(fmt.Sprintf("TryIncRef to %d", v+1))
+	}
 	return true
 }
 
@@ -114,19 +126,31 @@ func (r *Refs) TryIncRef() bool {
 //
 //go:nosplit
 func (r *Refs) DecRef(destroy func()) {
-	switch v := atomic.AddInt64(&r.refCount, -1); {
+	v := atomic.AddInt64(&r.refCount, -1)
+	if logTrace {
+		r.logEvent(fmt.Sprintf("DecRef to %d", v+1))
+	}
+	switch {
 	case v < -1:
 		panic(fmt.Sprintf("Decrementing non-positive ref count %p, owned by %T", r, ownerType))
 
 	case v == -1:
 		if refsvfs2.LeakCheckEnabled() {
-			refsvfs2.Unregister(r, fmt.Sprintf("%T", ownerType))
+			refsvfs2.Unregister(r, fmt.Sprintf("%T", ownerType), logTrace)
 		}
 		// Call the destructor.
 		if destroy != nil {
 			destroy()
 		}
 	}
+}
+
+// logEvent logs a reference-related event.
+//
+// Note that logTrace should be checked outside of logEvent, in order for the
+// compiler to entirely optimize logging away from hot paths when disabled.
+func (r *Refs) logEvent(msg string) {
+	refsvfs2.LogEvent(fmt.Sprintf("%T", ownerType), r, msg)
 }
 
 func (r *Refs) afterLoad() {

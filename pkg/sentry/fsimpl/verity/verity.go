@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/merkletree"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -41,32 +42,47 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// Name is the default filesystem name.
-const Name = "verity"
+const (
+	// Name is the default filesystem name.
+	Name = "verity"
 
-// merklePrefix is the prefix of the Merkle tree files. For example, the Merkle
-// tree file for "/foo" is "/.merkle.verity.foo".
-const merklePrefix = ".merkle.verity."
+	// merklePrefix is the prefix of the Merkle tree files. For example, the Merkle
+	// tree file for "/foo" is "/.merkle.verity.foo".
+	merklePrefix = ".merkle.verity."
 
-// merkleoffsetInParentXattr is the extended attribute name specifying the
-// offset of child hash in its parent's Merkle tree.
-const merkleOffsetInParentXattr = "user.merkle.offset"
+	// merkleOffsetInParentXattr is the extended attribute name specifying the
+	// offset of the child hash in its parent's Merkle tree.
+	merkleOffsetInParentXattr = "user.merkle.offset"
 
-// merkleSizeXattr is the extended attribute name specifying the size of data
-// hashed by the corresponding Merkle tree. For a file, it's the size of the
-// whole file. For a directory, it's the size of all its children's hashes.
-const merkleSizeXattr = "user.merkle.size"
+	// merkleSizeXattr is the extended attribute name specifying the size of data
+	// hashed by the corresponding Merkle tree. For a regular file, this is the
+	// file size. For a directory, this is the size of all its children's hashes.
+	merkleSizeXattr = "user.merkle.size"
 
-// sizeOfStringInt32 is the size for a 32 bit integer stored as string in
-// extended attributes. The maximum value of a 32 bit integer is 10 digits.
-const sizeOfStringInt32 = 10
+	// sizeOfStringInt32 is the size for a 32 bit integer stored as string in
+	// extended attributes. The maximum value of a 32 bit integer has 10 digits.
+	sizeOfStringInt32 = 10
 
-// noCrashOnVerificationFailure indicates whether the sandbox should panic
-// whenever verification fails. If true, an error is returned instead of
-// panicking. This should only be set for tests.
-// TOOD(b/165661693): Decide whether to panic or return error based on this
-// flag.
-var noCrashOnVerificationFailure bool
+	// logDentryRefs indicates whether stack traces should be logged when a dentry
+	// is registered/unregistered or its reference count is modified. This should
+	// only be set to true for debugging purposes, as it can generate an extremely
+	// large amount of output and drastically degrade performance.
+	logDentryRefs = false
+)
+
+var (
+	// noCrashOnVerificationFailure indicates whether the sandbox should panic
+	// whenever verification fails. If true, an error is returned instead of
+	// panicking. This should only be set for tests.
+	//
+	// TODO(b/165661693): Decide whether to panic or return error based on this
+	// flag.
+	noCrashOnVerificationFailure bool
+
+	// verityMu synchronizes concurrent operations that enable verity and perform
+	// verification checks.
+	verityMu sync.RWMutex
+)
 
 // FilesystemType implements vfs.FilesystemType.
 //
@@ -331,22 +347,31 @@ func (fs *filesystem) newDentry() *dentry {
 		fs: fs,
 	}
 	d.vfsd.Init(d)
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(d, "verity.dentry", logDentryRefs)
+	}
 	return d
 }
 
 // IncRef implements vfs.DentryImpl.IncRef.
 func (d *dentry) IncRef() {
-	atomic.AddInt64(&d.refs, 1)
+	r := atomic.AddInt64(&d.refs, 1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("IncRef to %d", r))
+	}
 }
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
 	for {
-		refs := atomic.LoadInt64(&d.refs)
-		if refs <= 0 {
+		r := atomic.LoadInt64(&d.refs)
+		if r <= 0 {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&d.refs, refs, refs+1) {
+		if atomic.CompareAndSwapInt64(&d.refs, r, r+1) {
+			if logDentryRefs {
+				d.logRefEvent(fmt.Sprintf("TryIncRef to %d", r+1))
+			}
 			return true
 		}
 	}
@@ -354,11 +379,15 @@ func (d *dentry) TryIncRef() bool {
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&d.refs, -1); refs == 0 {
+	r := atomic.AddInt64(&d.refs, -1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+	}
+	if r == 0 {
 		d.fs.renameMu.Lock()
 		d.checkDropLocked(ctx)
 		d.fs.renameMu.Unlock()
-	} else if refs < 0 {
+	} else if r < 0 {
 		panic("verity.dentry.DecRef() called without holding a reference")
 	}
 }
@@ -393,6 +422,9 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	if d.lowerVD.Ok() {
 		d.lowerVD.DecRef(ctx)
 	}
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Unregister(d, "verity.dentry", logDentryRefs)
+	}
 
 	if d.lowerMerkleVD.Ok() {
 		d.lowerMerkleVD.DecRef(ctx)
@@ -404,11 +436,37 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 			delete(d.parent.children, d.name)
 		}
 		d.parent.dirMu.Unlock()
-		if refs := atomic.AddInt64(&d.parent.refs, -1); refs == 0 {
+		r := atomic.AddInt64(&d.parent.refs, -1)
+		if logDentryRefs {
+			d.parent.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+		}
+		if r == 0 {
 			d.parent.checkDropLocked(ctx)
-		} else if refs < 0 {
+		} else if r < 0 {
 			panic("verity.dentry.DecRef() called without holding a reference")
 		}
+	}
+
+	refsvfs2.Unregister(d, "verity.dentry", logDentryRefs)
+}
+
+// logRefEvent logs a reference-related event.
+//
+// Note that logDentryRefs should be checked outside of logRefEvent, in order
+// for the compiler to entirely optimize logging away from hot paths when
+// disabled.
+func (d *dentry) logRefEvent(msg string) {
+	refsvfs2.LogEvent("verity.dentry", d, msg)
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (d *dentry) LeakMessage() string {
+	return fmt.Sprintf("[verity.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+}
+
+func (d *dentry) afterLoad() {
+	if refsvfs2.LeakCheckEnabled() && atomic.LoadInt64(&d.refs) != -1 {
+		refsvfs2.Register(d, "verity.dentry", logDentryRefs)
 	}
 }
 

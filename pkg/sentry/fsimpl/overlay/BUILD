@@ -30,6 +30,8 @@ go_library(
         "//pkg/context",
         "//pkg/fspath",
         "//pkg/log",
+        "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/sentry/arch",
         "//pkg/sentry/fs/lock",
         "//pkg/sentry/kernel/auth",

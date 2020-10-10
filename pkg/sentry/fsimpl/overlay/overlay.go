@@ -33,12 +33,14 @@
 package overlay
 
 import (
+	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -47,8 +49,16 @@ import (
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
-// Name is the default filesystem name.
-const Name = "overlay"
+const (
+	// Name is the default filesystem name.
+	Name = "overlay"
+
+	// logDentryRefs indicates whether stack traces should be logged when a dentry
+	// is registered/unregistered or its reference count is modified. This should
+	// only be set to true for debugging purposes, as it can generate an extremely
+	// large amount of output and drastically degrade performance.
+	logDentryRefs = false
+)
 
 // FilesystemType implements vfs.FilesystemType.
 //
@@ -484,6 +494,9 @@ func (fs *filesystem) newDentry() *dentry {
 	}
 	d.lowerVDs = d.inlineLowerVDs[:0]
 	d.vfsd.Init(d)
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(d, "overlay.dentry", logDentryRefs)
+	}
 	return d
 }
 
@@ -491,17 +504,23 @@ func (fs *filesystem) newDentry() *dentry {
 func (d *dentry) IncRef() {
 	// d.refs may be 0 if d.fs.renameMu is locked, which serializes against
 	// d.checkDropLocked().
-	atomic.AddInt64(&d.refs, 1)
+	r := atomic.AddInt64(&d.refs, 1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("IncRef to %d", r))
+	}
 }
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
 	for {
-		refs := atomic.LoadInt64(&d.refs)
-		if refs <= 0 {
+		r := atomic.LoadInt64(&d.refs)
+		if r <= 0 {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&d.refs, refs, refs+1) {
+		if atomic.CompareAndSwapInt64(&d.refs, r, r+1) {
+			if logDentryRefs {
+				d.logRefEvent(fmt.Sprintf("TryIncRef to %d", r+1))
+			}
 			return true
 		}
 	}
@@ -509,11 +528,15 @@ func (d *dentry) TryIncRef() bool {
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&d.refs, -1); refs == 0 {
+	r := atomic.AddInt64(&d.refs, -1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+	}
+	if r == 0 {
 		d.fs.renameMu.Lock()
 		d.checkDropLocked(ctx)
 		d.fs.renameMu.Unlock()
-	} else if refs < 0 {
+	} else if r < 0 {
 		panic("overlay.dentry.DecRef() called without holding a reference")
 	}
 }
@@ -577,11 +600,38 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		d.parent.dirMu.Unlock()
 		// Drop the reference held by d on its parent without recursively
 		// locking d.fs.renameMu.
-		if refs := atomic.AddInt64(&d.parent.refs, -1); refs == 0 {
+		r := atomic.AddInt64(&d.parent.refs, -1)
+		if logDentryRefs {
+			d.parent.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+		}
+		if r == 0 {
 			d.parent.checkDropLocked(ctx)
-		} else if refs < 0 {
+		} else if r < 0 {
 			panic("overlay.dentry.DecRef() called without holding a reference")
 		}
+	}
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Unregister(d, "overlay.dentry", logDentryRefs)
+	}
+}
+
+// logRefEvent logs a reference-related event.
+//
+// Note that logDentryRefs should be checked outside of logRefEvent, in order
+// for the compiler to entirely optimize logging away from hot paths when
+// disabled.
+func (d *dentry) logRefEvent(msg string) {
+	refsvfs2.LogEvent("overlay.dentry", d, msg)
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (d *dentry) LeakMessage() string {
+	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+}
+
+func (d *dentry) afterLoad() {
+	if refsvfs2.LeakCheckEnabled() && atomic.LoadInt64(&d.refs) != -1 {
+		refsvfs2.Register(d, "overlay.dentry", logDentryRefs)
 	}
 }
 

@@ -52,7 +52,7 @@ func LeakCheckEnabled() bool {
 }
 
 // Register adds obj to the live object map.
-func Register(obj CheckedObject, typ string) {
+func Register(obj CheckedObject, typ string, logTrace bool) {
 	for _, str := range ignored {
 		if strings.Contains(typ, str) {
 			return
@@ -64,10 +64,13 @@ func Register(obj CheckedObject, typ string) {
 	}
 	liveObjects[obj] = struct{}{}
 	liveObjectsMu.Unlock()
+	if logTrace {
+		LogEvent(typ, obj, "registered")
+	}
 }
 
 // Unregister removes obj from the live object map.
-func Unregister(obj CheckedObject, typ string) {
+func Unregister(obj CheckedObject, typ string, logTrace bool) {
 	liveObjectsMu.Lock()
 	defer liveObjectsMu.Unlock()
 	if _, ok := liveObjects[obj]; !ok {
@@ -79,6 +82,15 @@ func Unregister(obj CheckedObject, typ string) {
 		panic(fmt.Sprintf("Expected to find entry in leak checking map for reference %p", obj))
 	}
 	delete(liveObjects, obj)
+	if logTrace {
+		LogEvent(typ, obj, "unregistered")
+	}
+}
+
+// LogEvent logs a message for the given reference-counted object.
+func LogEvent(typ string, obj CheckedObject, msg string) {
+	log.Infof("[%s %p] %s:", typ, obj, msg)
+	log.Infof(refs_vfs1.FormatStack(refs_vfs1.RecordStack()))
 }
 
 // DoLeakCheck iterates through the live object map and logs a message for each

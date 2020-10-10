@@ -44,6 +44,8 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
+	refs_vfs1 "gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -58,8 +60,16 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// Name is the default filesystem name.
-const Name = "9p"
+const (
+	// Name is the default filesystem name.
+	Name = "9p"
+
+	// logDentryRefs indicates whether stack traces should be logged when a dentry
+	// is registered/unregistered or its reference count is modified. This should
+	// only be set to true for debugging purposes, as it can generate an extremely
+	// large amount of output and drastically degrade performance.
+	logDentryRefs = false
+)
 
 // FilesystemType implements vfs.FilesystemType.
 //
@@ -103,10 +113,16 @@ type filesystem struct {
 
 	// cachedDentries contains all dentries with 0 references. (Due to race
 	// conditions, it may also contain dentries with non-zero references.)
-	// cachedDentriesLen is the number of dentries in cachedDentries. These
-	// fields are protected by renameMu.
+	// cachedDentriesLen is the number of dentries in cachedDentries.
+	// cacheReleased indicates whether the cache is in the process of being
+	// released, in which case nothing else can be cached. These fields are
+	// protected by renameMu.
 	cachedDentries    dentryList
 	cachedDentriesLen uint64
+	cacheReleased     bool
+
+	// root is the filesystem root. It is immutable.
+	root *dentry
 
 	// syncableDentries contains all dentries in this filesystem for which
 	// !dentry.file.isNil(). specialFileFDs contains all open specialFileFDs.
@@ -500,10 +516,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 	// Set the root's reference count to 2. One reference is returned to the
-	// caller, and the other is deliberately leaked to prevent the root from
-	// being "cached" and subsequently evicted. Its resources will still be
-	// cleaned up by fs.Release().
+	// caller, and the other is held by fs to prevent the root from being "cached"
+	// and subsequently evicted.
 	root.refs = 2
+	fs.root = root
 
 	return &fs.vfsfs, &root.vfsd, nil
 }
@@ -511,14 +527,13 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	mf := fs.mfp.MemoryFile()
-
 	fs.syncMu.Lock()
 	for d := range fs.syncableDentries {
 		d.handleMu.Lock()
 		d.dataMu.Lock()
 		if h := d.writeHandleLocked(); h.isOpen() {
 			// Write dirty cached data to the remote file.
-			if err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size, fs.mfp.MemoryFile(), h.writeFromBlocksAt); err != nil {
+			if err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size, mf, h.writeFromBlocksAt); err != nil {
 				log.Warningf("gofer.filesystem.Release: failed to flush dentry: %v", err)
 			}
 			// TODO(jamieliu): Do we need to flushf/fsync d?
@@ -539,12 +554,95 @@ func (fs *filesystem) Release(ctx context.Context) {
 	// fs.
 	fs.syncMu.Unlock()
 
+	// If leak checking is enabled, release all outstanding references in the
+	// filesystem. We deliberately avoid doing this outside of leak checking; we
+	// have released all external resources above rather than relying on dentry
+	// destructors.
+	if refs_vfs1.GetLeakMode() != refs_vfs1.NoLeakChecking {
+		fs.root.releaseSynthetic(ctx)
+		fs.releaseCache(ctx)
+
+		// An extra reference is held by the filesystem on the root to prevent it from
+		// being cached/evicted.
+		fs.root.DecRef(ctx)
+	}
+
 	if !fs.iopts.LeakConnection {
 		// Close the connection to the server. This implicitly clunks all fids.
 		fs.client.Close()
 	}
 
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+}
+
+// releaseSynthetic traverses the tree with root d and decrements the reference
+// count on every synthetic dentry. Synthetic dentries have one reference for
+// existence that should be dropped during filesystem.Release.
+func (d *dentry) releaseSynthetic(ctx context.Context) {
+	if d.isSynthetic() {
+		d.DecRef(ctx)
+	}
+	if d.isDir() {
+		var children []*dentry
+		d.dirMu.Lock()
+		for _, child := range d.children {
+			children = append(children, child)
+		}
+		d.dirMu.Unlock()
+		for _, child := range children {
+			if child != nil {
+				child.releaseSynthetic(ctx)
+			}
+		}
+	}
+}
+
+// releaseCache cleans up cached dentries (and their ancestors, indirectly).
+// The cache is disabled so that when a dentry reaches zero references, it will
+// skip the cache and automatically be destroyed.
+//
+// Note that only leaf nodes can be destroyed, since children hold references on
+// their parents. Once the leaf nodes are destroyed, their parents may also
+// become leaf nodes that should be destroyed. As a result, we may need to
+// iterate over the cache multiple times, until no new leaf nodes are
+// discovered.
+func (fs *filesystem) releaseCache(ctx context.Context) {
+	fs.renameMu.Lock()
+	defer fs.renameMu.Unlock()
+	cached := make([]*dentry, 0, fs.cachedDentriesLen)
+	for d := fs.cachedDentries.Front(); d != nil; d = d.Next() {
+		cached = append(cached, d)
+	}
+
+	fs.cachedDentries.Reset()
+	fs.cachedDentriesLen = 0
+	fs.cacheReleased = true
+
+	done := false
+	for !done {
+		done = true
+		for _, d := range cached {
+			// Make sure that d wasn't already destroyed during a previous iteration.
+			if atomic.LoadInt64(&d.refs) != -1 && d.isLeaf() {
+				d.checkCachingLocked(ctx)
+				done = false
+			}
+		}
+	}
+}
+
+func (d *dentry) isLeaf() bool {
+	if d.isDir() {
+		d.dirMu.Lock()
+		defer d.dirMu.Unlock()
+		// Checking len(d.children) > 0 is not enough due to negative entries.
+		for _, c := range d.children {
+			if c != nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // dentry implements vfs.DentryImpl.
@@ -795,6 +893,9 @@ func (fs *filesystem) newDentry(ctx context.Context, file p9file, qid p9.QID, ma
 		d.nlink = uint32(attr.NLink)
 	}
 	d.vfsd.Init(d)
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(d, "gofer.dentry", logDentryRefs)
+	}
 
 	fs.syncMu.Lock()
 	fs.syncableDentries[d] = struct{}{}
@@ -1139,17 +1240,23 @@ func dentryGIDFromP9GID(gid p9.GID) uint32 {
 func (d *dentry) IncRef() {
 	// d.refs may be 0 if d.fs.renameMu is locked, which serializes against
 	// d.checkCachingLocked().
-	atomic.AddInt64(&d.refs, 1)
+	r := atomic.AddInt64(&d.refs, 1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("IncRef to %d", r))
+	}
 }
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
 	for {
-		refs := atomic.LoadInt64(&d.refs)
-		if refs <= 0 {
+		r := atomic.LoadInt64(&d.refs)
+		if r <= 0 {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&d.refs, refs, refs+1) {
+		if atomic.CompareAndSwapInt64(&d.refs, r, r+1) {
+			if logDentryRefs {
+				d.logRefEvent(fmt.Sprintf("TryIncRef to %d", r+1))
+			}
 			return true
 		}
 	}
@@ -1157,11 +1264,15 @@ func (d *dentry) TryIncRef() bool {
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&d.refs, -1); refs == 0 {
+	r := atomic.AddInt64(&d.refs, -1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+	}
+	if r == 0 {
 		d.fs.renameMu.Lock()
 		d.checkCachingLocked(ctx)
 		d.fs.renameMu.Unlock()
-	} else if refs < 0 {
+	} else if r < 0 {
 		panic("gofer.dentry.DecRef() called without holding a reference")
 	}
 }
@@ -1170,8 +1281,32 @@ func (d *dentry) DecRef(ctx context.Context) {
 // d.checkCachingLocked, even if d's reference count reaches 0; callers are
 // responsible for ensuring that d.checkCachingLocked will be called later.
 func (d *dentry) decRefLocked() {
-	if refs := atomic.AddInt64(&d.refs, -1); refs < 0 {
+	r := atomic.AddInt64(&d.refs, -1)
+	if logDentryRefs {
+		d.logRefEvent(fmt.Sprintf("decRefLocked to %d", r))
+	}
+	if r < 0 {
 		panic("gofer.dentry.decRefLocked() called without holding a reference")
+	}
+}
+
+// logRefEvent logs a reference-related event.
+//
+// Note that logDentryRefs should be checked outside of logRefEvent, in order
+// for the compiler to entirely optimize logging away from hot paths when
+// disabled.
+func (d *dentry) logRefEvent(msg string) {
+	refsvfs2.LogEvent("gofer.dentry", d, msg)
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (d *dentry) LeakMessage() string {
+	return fmt.Sprintf("[gofer.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+}
+
+func (d *dentry) afterLoad() {
+	if refsvfs2.LeakCheckEnabled() && atomic.LoadInt64(&d.refs) != -1 {
+		refsvfs2.Register(d, "gofer.dentry", logDentryRefs)
 	}
 }
 
@@ -1257,7 +1392,19 @@ func (d *dentry) checkCachingLocked(ctx context.Context) {
 	if d.watches.Size() > 0 {
 		return
 	}
-	// If d is already cached, just move it to the front of the LRU.
+
+	if d.fs.cacheReleased {
+		if d.parent != nil {
+			d.parent.dirMu.Lock()
+			delete(d.parent.children, d.name)
+			d.parent.dirMu.Unlock()
+		}
+		d.destroyLocked(ctx)
+	}
+
+	// If d is already cached, just move it to the front of the LRU. The
+	// exception is during filesystem.releaseCache, during which we make the
+	// cache size 0 to force all dentries to evict themselves.
 	if d.cached {
 		d.fs.cachedDentries.Remove(d)
 		d.fs.cachedDentries.PushFront(d)
@@ -1374,11 +1521,19 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	// Drop the reference held by d on its parent without recursively locking
 	// d.fs.renameMu.
 	if d.parent != nil {
-		if refs := atomic.AddInt64(&d.parent.refs, -1); refs == 0 {
+		r := atomic.AddInt64(&d.parent.refs, -1)
+		if logDentryRefs {
+			d.parent.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+		}
+		if r == 0 {
 			d.parent.checkCachingLocked(ctx)
-		} else if refs < 0 {
+		} else if r < 0 {
 			panic("gofer.dentry.DecRef() called without holding a reference")
 		}
+	}
+
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Unregister(d, "gofer.dentry", logDentryRefs)
 	}
 }
 

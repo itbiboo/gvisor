@@ -24,9 +24,16 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
+
+// logMountRefs indicates whether stack traces should be logged when a Mount is
+// registered/unregistered or its reference count is modified. This should only
+// be set to true for debugging purposes, as it can generate an extremely large
+// amount of output and drastically degrade performance.
+const logMountRefs = false
 
 // A Mount is a replacement of a Dentry (Mount.key.point) from one Filesystem
 // (Mount.key.parent.fs) with a Dentry (Mount.root) from another Filesystem
@@ -105,6 +112,9 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 	}
 	if opts.ReadOnly {
 		mnt.setReadOnlyLocked(true)
+	}
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(mnt, "vfs.Mount", logMountRefs)
 	}
 	return mnt
 }
@@ -470,11 +480,14 @@ func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
 // tryIncMountedRef does not require that a reference is held on mnt.
 func (mnt *Mount) tryIncMountedRef() bool {
 	for {
-		refs := atomic.LoadInt64(&mnt.refs)
-		if refs <= 0 { // refs < 0 => MSB set => eagerly unmounted
+		r := atomic.LoadInt64(&mnt.refs)
+		if r <= 0 { // r < 0 => MSB set => eagerly unmounted
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&mnt.refs, refs, refs+1) {
+		if atomic.CompareAndSwapInt64(&mnt.refs, r, r+1) {
+			if logMountRefs {
+				mnt.logRefEvent(fmt.Sprintf("IncRef to %d", r+1))
+			}
 			return true
 		}
 	}
@@ -484,28 +497,61 @@ func (mnt *Mount) tryIncMountedRef() bool {
 func (mnt *Mount) IncRef() {
 	// In general, negative values for mnt.refs are valid because the MSB is
 	// the eager-unmount bit.
-	atomic.AddInt64(&mnt.refs, 1)
+	r := atomic.AddInt64(&mnt.refs, 1)
+	if logMountRefs {
+		mnt.logRefEvent(fmt.Sprintf("IncRef to %d", r))
+	}
+}
+
+func (mnt *Mount) destroy(ctx context.Context) {
+	var vd VirtualDentry
+	if mnt.parent() != nil {
+		mnt.vfs.mountMu.Lock()
+		mnt.vfs.mounts.seq.BeginWrite()
+		vd = mnt.vfs.disconnectLocked(mnt)
+		mnt.vfs.mounts.seq.EndWrite()
+		mnt.vfs.mountMu.Unlock()
+	}
+	if mnt.root != nil {
+		mnt.root.DecRef(ctx)
+	}
+	mnt.fs.DecRef(ctx)
+	if vd.Ok() {
+		vd.DecRef(ctx)
+	}
 }
 
 // DecRef decrements mnt's reference count.
 func (mnt *Mount) DecRef(ctx context.Context) {
-	refs := atomic.AddInt64(&mnt.refs, -1)
-	if refs&^math.MinInt64 == 0 { // mask out MSB
-		var vd VirtualDentry
-		if mnt.parent() != nil {
-			mnt.vfs.mountMu.Lock()
-			mnt.vfs.mounts.seq.BeginWrite()
-			vd = mnt.vfs.disconnectLocked(mnt)
-			mnt.vfs.mounts.seq.EndWrite()
-			mnt.vfs.mountMu.Unlock()
+	r := atomic.AddInt64(&mnt.refs, -1)
+	if logMountRefs {
+		mnt.logRefEvent(fmt.Sprintf("DecRef to %d", r))
+	}
+	if r&^math.MinInt64 == 0 { // mask out MSB
+		if refsvfs2.LeakCheckEnabled() {
+			refsvfs2.Unregister(mnt, "vfs.Mount", logMountRefs)
 		}
-		if mnt.root != nil {
-			mnt.root.DecRef(ctx)
-		}
-		mnt.fs.DecRef(ctx)
-		if vd.Ok() {
-			vd.DecRef(ctx)
-		}
+		mnt.destroy(ctx)
+	}
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (mnt *Mount) LeakMessage() string {
+	return fmt.Sprintf("[vfs.Mount %p] reference count of %d instead of 0", mnt, atomic.LoadInt64(&mnt.refs))
+}
+
+// logRefEvent logs a reference-related event.
+//
+// Note that logMountRefs should be checked outside of logRefEvent, in order
+// for the compiler to entirely optimize logging away from hot paths when
+// disabled.
+func (mnt *Mount) logRefEvent(msg string) {
+	refsvfs2.LogEvent("vfs.Mount", mnt, msg)
+}
+
+func (mnt *Mount) afterLoad() {
+	if refsvfs2.LeakCheckEnabled() && atomic.LoadInt64(&mnt.refs) != 0 {
+		refsvfs2.Register(mnt, "vfs.Mount", logMountRefs)
 	}
 }
 

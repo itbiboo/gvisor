@@ -53,6 +53,7 @@ go_library(
         "//pkg/log",
         "//pkg/p9",
         "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/sentry/fs/fsutil",
         "//pkg/sentry/fs/lock",
