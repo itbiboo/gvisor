@@ -33,12 +33,14 @@
 package overlay
 
 import (
+	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -484,6 +486,9 @@ func (fs *filesystem) newDentry() *dentry {
 	}
 	d.lowerVDs = d.inlineLowerVDs[:0]
 	d.vfsd.Init(d)
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(d, "overlay.dentry")
+	}
 	return d
 }
 
@@ -582,6 +587,20 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		} else if refs < 0 {
 			panic("overlay.dentry.DecRef() called without holding a reference")
 		}
+	}
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Unregister(d, "overlay.dentry")
+	}
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (d *dentry) LeakMessage() string {
+	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+}
+
+func (d *dentry) afterLoad() {
+	if refsvfs2.LeakCheckEnabled() && atomic.LoadInt64(&d.refs) != -1 {
+		refsvfs2.Register(d, "overlay.dentry")
 	}
 }
 

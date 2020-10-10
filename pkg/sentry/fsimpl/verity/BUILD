@@ -15,6 +15,7 @@ go_library(
         "//pkg/fspath",
         "//pkg/marshal/primitive",
         "//pkg/merkletree",
+        "//pkg/refsvfs2",
         "//pkg/sentry/arch",
         "//pkg/sentry/fs/lock",
         "//pkg/sentry/kernel",
