@@ -423,6 +423,7 @@ func (p *Protocol) newAddr(ctx context.Context, msg *netlink.Message, ms *netlin
 		}
 		attrs = rest
 
+		// NOTE: Only the IFA_LOCAL address type is currently supported.
 		switch ahdr.Type {
 		case linux.IFA_LOCAL:
 			err := stack.AddInterfaceAddr(int32(ifa.Index), inet.InterfaceAddr{
@@ -439,8 +440,51 @@ func (p *Protocol) newAddr(ctx context.Context, msg *netlink.Message, ms *netlin
 			} else if err != nil {
 				return syserr.ErrInvalidArgument
 			}
+		default:
+			return syserr.ErrNotSupported
 		}
 	}
+	return nil
+}
+
+// delAddr handles RTM_DELADDR requests.
+func (p *Protocol) delAddr(ctx context.Context, msg *netlink.Message, ms *netlink.MessageSet) *syserr.Error {
+	stack := inet.StackFromContext(ctx)
+	if stack == nil {
+		// No network stack.
+		return syserr.ErrProtocolNotSupported
+	}
+
+	var ifa linux.InterfaceAddrMessage
+	attrs, ok := msg.GetData(&ifa)
+	if !ok {
+		return syserr.ErrInvalidArgument
+	}
+
+	for !attrs.Empty() {
+		ahdr, value, rest, ok := attrs.ParseFirst()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		attrs = rest
+
+		// NOTE: Only the IFA_LOCAL address type is currently supported.
+		switch ahdr.Type {
+		case linux.IFA_LOCAL:
+			err := stack.RemoveInterfaceAddr(int32(ifa.Index), inet.InterfaceAddr{
+				Family:    ifa.Family,
+				PrefixLen: ifa.PrefixLen,
+				Flags:     ifa.Flags,
+				Addr:      value,
+			})
+			if err != nil {
+				return syserr.ErrInvalidArgument
+			}
+		default:
+			return syserr.ErrNotSupported
+		}
+	}
+
 	return nil
 }
 
@@ -485,6 +529,8 @@ func (p *Protocol) ProcessMessage(ctx context.Context, msg *netlink.Message, ms 
 			return p.dumpRoutes(ctx, msg, ms)
 		case linux.RTM_NEWADDR:
 			return p.newAddr(ctx, msg, ms)
+		case linux.RTM_DELADDR:
+			return p.delAddr(ctx, msg, ms)
 		default:
 			return syserr.ErrNotSupported
 		}

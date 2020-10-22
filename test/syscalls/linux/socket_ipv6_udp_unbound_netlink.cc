@@ -15,9 +15,12 @@
 #include "test/syscalls/linux/socket_ipv6_udp_unbound_netlink.h"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "gtest/gtest.h"
 #include "test/syscalls/linux/socket_netlink_route_util.h"
+#include "test/syscalls/linux/socket_test_util.h"
 #include "test/util/capability_util.h"
 
 namespace gvisor {
@@ -46,6 +49,31 @@ TEST_P(IPv6UDPUnboundSocketNetlinkTest, JoinSubnet) {
   auto sock = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   EXPECT_THAT(bind(sock->get(), reinterpret_cast<sockaddr*>(&sender_addr.addr),
                    sender_addr.addr_len),
+              SyscallFailsWithErrno(EADDRNOTAVAIL));
+}
+
+// Checks that connect to the loopback address returns EADDRNOTAVAIL, if the
+// address isn't set.
+TEST_P(IPv6UDPUnboundSocketNetlinkTest, ConnectToBadLocalAddress) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  // Delete the loopback address from the loopback interface.
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET6,
+                                   /*prefixlen=*/128, &in6addr_loopback,
+                                   sizeof(in6addr_loopback)));
+  Cleanup defer_addr_removal =
+      Cleanup([loopback_link = std::move(loopback_link)] {
+        EXPECT_NO_ERRNO(LinkAddLocalAddr(loopback_link.index, AF_INET6,
+                                         /*prefixlen=*/128, &in6addr_loopback,
+                                         sizeof(in6addr_loopback)));
+      });
+
+  TestAddress addr = V6Loopback();
+  reinterpret_cast<sockaddr_in6*>(&addr.addr)->sin6_port = 65535;
+  auto sock = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+  EXPECT_THAT(connect(sock->get(), reinterpret_cast<sockaddr*>(&addr.addr),
+                      addr.addr_len),
               SyscallFailsWithErrno(EADDRNOTAVAIL));
 }
 

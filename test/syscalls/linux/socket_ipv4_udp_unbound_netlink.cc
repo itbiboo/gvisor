@@ -40,17 +40,9 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, JoinSubnet) {
                                    /*prefixlen=*/24, &addr, sizeof(addr)));
   Cleanup defer_addr_removal = Cleanup(
       [loopback_link = std::move(loopback_link), addr = std::move(addr)] {
-        if (IsRunningOnGvisor()) {
-          // TODO(gvisor.dev/issue/3921): Remove this once deleting addresses
-          // via netlink is supported.
-          EXPECT_THAT(LinkDelLocalAddr(loopback_link.index, AF_INET,
-                                       /*prefixlen=*/24, &addr, sizeof(addr)),
-                      PosixErrorIs(EOPNOTSUPP, ::testing::_));
-        } else {
-          EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET,
-                                           /*prefixlen=*/24, &addr,
-                                           sizeof(addr)));
-        }
+        EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET,
+                                         /*prefixlen=*/24, &addr,
+                                         sizeof(addr)));
       });
 
   auto snd_sock = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
@@ -124,17 +116,9 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, ReuseAddrSubnetDirectedBroadcast) {
                                    24 /* prefixlen */, &addr, sizeof(addr)));
   Cleanup defer_addr_removal = Cleanup(
       [loopback_link = std::move(loopback_link), addr = std::move(addr)] {
-        if (IsRunningOnGvisor()) {
-          // TODO(gvisor.dev/issue/3921): Remove this once deleting addresses
-          // via netlink is supported.
-          EXPECT_THAT(LinkDelLocalAddr(loopback_link.index, AF_INET,
-                                       /*prefixlen=*/24, &addr, sizeof(addr)),
-                      PosixErrorIs(EOPNOTSUPP, ::testing::_));
-        } else {
-          EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET,
-                                           /*prefixlen=*/24, &addr,
-                                           sizeof(addr)));
-        }
+        EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET,
+                                         /*prefixlen=*/24, &addr,
+                                         sizeof(addr)));
       });
 
   TestAddress broadcast_address("SubnetBroadcastAddress");
@@ -219,6 +203,31 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, ReuseAddrSubnetDirectedBroadcast) {
           << "write socks[" << w << "] & read socks[" << r << "]";
     }
   }
+}
+
+// Checks that connect to the loopback address returns EADDRNOTAVAIL, if the
+// address isn't set.
+TEST_P(IPv4UDPUnboundSocketNetlinkTest, ConnectToBadLocalAddress) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  // Delete the loopback address from the loopback interface.
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  struct in_addr laddr;
+  laddr.s_addr = htonl(INADDR_LOOPBACK);
+  EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET,
+                                   /*prefixlen=*/8, &laddr, sizeof(laddr)));
+  Cleanup defer_addr_removal = Cleanup(
+      [loopback_link = std::move(loopback_link), addr = std::move(laddr)] {
+        EXPECT_NO_ERRNO(LinkAddLocalAddr(loopback_link.index, AF_INET,
+                                         /*prefixlen=*/8, &addr, sizeof(addr)));
+      });
+
+  TestAddress addr = V4Loopback();
+  reinterpret_cast<sockaddr_in*>(&addr.addr)->sin_port = 65535;
+  auto sock = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+  EXPECT_THAT(connect(sock->get(), reinterpret_cast<sockaddr*>(&addr.addr),
+                      addr.addr_len),
+              SyscallFailsWithErrno(EADDRNOTAVAIL));
 }
 
 }  // namespace testing

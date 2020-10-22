@@ -324,7 +324,12 @@ func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 }
 
 // AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+func (s *Stack) AddInterfaceAddr(int32, inet.InterfaceAddr) error {
+	return syserror.EACCES
+}
+
+// RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
+func (s *Stack) RemoveInterfaceAddr(int32, inet.InterfaceAddr) error {
 	return syserror.EACCES
 }
 
@@ -359,7 +364,7 @@ func (s *Stack) TCPSACKEnabled() (bool, error) {
 }
 
 // SetTCPSACKEnabled implements inet.Stack.SetTCPSACKEnabled.
-func (s *Stack) SetTCPSACKEnabled(enabled bool) error {
+func (s *Stack) SetTCPSACKEnabled(bool) error {
 	return syserror.EACCES
 }
 
@@ -369,7 +374,7 @@ func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
 }
 
 // SetTCPRecovery implements inet.Stack.SetTCPRecovery.
-func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
+func (s *Stack) SetTCPRecovery(inet.TCPLossRecovery) error {
 	return syserror.EACCES
 }
 
@@ -430,18 +435,18 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 	}
 
 	if rawLine == "" {
-		return fmt.Errorf("Failed to get raw line")
+		return fmt.Errorf("failed to get raw line")
 	}
 
 	parts := strings.SplitN(rawLine, ":", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("Failed to get prefix from: %q", rawLine)
+		return fmt.Errorf("failed to get prefix from: %q", rawLine)
 	}
 
 	sliceStat = toSlice(stat)
 	fields := strings.Fields(strings.TrimSpace(parts[1]))
 	if len(fields) != len(sliceStat) {
-		return fmt.Errorf("Failed to parse fields: %q", rawLine)
+		return fmt.Errorf("failed to parse fields: %q", rawLine)
 	}
 	if _, ok := stat.(*inet.StatSNMPTCP); ok {
 		snmpTCP = true
@@ -457,7 +462,7 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			sliceStat[i], err = strconv.ParseUint(fields[i], 10, 64)
 		}
 		if err != nil {
-			return fmt.Errorf("Failed to parse field %d from: %q, %v", i, rawLine, err)
+			return fmt.Errorf("failed to parse field %d from: %q, %v", i, rawLine, err)
 		}
 	}
 
@@ -495,6 +500,6 @@ func (s *Stack) Forwarding(protocol tcpip.NetworkProtocolNumber) bool {
 }
 
 // SetForwarding implements inet.Stack.SetForwarding.
-func (s *Stack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+func (s *Stack) SetForwarding(tcpip.NetworkProtocolNumber, bool) error {
 	return syserror.EACCES
 }
