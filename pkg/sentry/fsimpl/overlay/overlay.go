@@ -22,6 +22,7 @@
 //   filesystem.renameMu
 //     dentry.dirMu
 //       dentry.copyMu
+//         filesystem.devMu
 //         *** "memmap.Mappable locks" below this point
 //         dentry.mapsMu
 //           *** "memmap.Mappable locks taken by Translate" below this point
@@ -99,10 +100,15 @@ type filesystem struct {
 	// is immutable.
 	dirDevMinor uint32
 
-	// lowerDevMinors maps lower layer filesystems to device minor numbers
-	// assigned to non-directory files originating from that filesystem.
-	// lowerDevMinors is immutable.
-	lowerDevMinors map[*vfs.Filesystem]uint32
+	// lowerDevMinors maps device numbers from lower layer filesystems to
+	// device minor numbers assigned to non-directory files originating from
+	// that filesystem. (This remapping is necessary for lower layers because a
+	// file on a lower layer, and that same file on an overlay, are
+	// distinguishable because they will diverge after copy-up; this isn't true
+	// for non-directory files already on the upper layer.) lowerDevMinors is
+	// protected by devMu.
+	devMu          sync.Mutex `state:"nosave"`
+	lowerDevMinors map[layerDevNumber]uint32
 
 	// renameMu synchronizes renaming with non-renaming operations in order to
 	// ensure consistent lock ordering between dentry.dirMu in different
@@ -112,6 +118,12 @@ type filesystem struct {
 	// lastDirIno is the last inode number assigned to a directory. lastDirIno
 	// is accessed using atomic memory operations.
 	lastDirIno uint64
+}
+
+// +stateify savable
+type layerDevNumber struct {
+	major uint32
+	minor uint32
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -219,25 +231,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, syserror.EINVAL
 	}
 
-	// Allocate device numbers.
+	// Allocate dirDevMinor. lowerDevMinors are allocated dynamically.
 	dirDevMinor, err := vfsObj.GetAnonBlockDevMinor()
 	if err != nil {
 		return nil, nil, err
-	}
-	lowerDevMinors := make(map[*vfs.Filesystem]uint32)
-	for _, lowerRoot := range fsopts.LowerRoots {
-		lowerFS := lowerRoot.Mount().Filesystem()
-		if _, ok := lowerDevMinors[lowerFS]; !ok {
-			devMinor, err := vfsObj.GetAnonBlockDevMinor()
-			if err != nil {
-				vfsObj.PutAnonBlockDevMinor(dirDevMinor)
-				for _, lowerDevMinor := range lowerDevMinors {
-					vfsObj.PutAnonBlockDevMinor(lowerDevMinor)
-				}
-				return nil, nil, err
-			}
-			lowerDevMinors[lowerFS] = devMinor
-		}
 	}
 
 	// Take extra references held by the filesystem.
@@ -252,7 +249,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		opts:           fsopts,
 		creds:          creds.Fork(),
 		dirDevMinor:    dirDevMinor,
-		lowerDevMinors: lowerDevMinors,
+		lowerDevMinors: make(map[layerDevNumber]uint32),
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -302,7 +299,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		root.ino = fs.newDirIno()
 	} else if !root.upperVD.Ok() {
 		root.devMajor = linux.UNNAMED_MAJOR
-		root.devMinor = fs.lowerDevMinors[root.lowerVDs[0].Mount().Filesystem()]
+		rootDevMinor, err := fs.getLowerDevMinor(rootStat.DevMajor, rootStat.DevMinor)
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to get device number for root: %v", err)
+			root.destroyLocked(ctx)
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, err
+		}
+		root.devMinor = rootDevMinor
 		root.ino = rootStat.Ino
 	} else {
 		root.devMajor = rootStat.DevMajor
@@ -373,6 +377,21 @@ func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 
 func (fs *filesystem) newDirIno() uint64 {
 	return atomic.AddUint64(&fs.lastDirIno, 1)
+}
+
+func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, error) {
+	fs.devMu.Lock()
+	defer fs.devMu.Unlock()
+	orig := layerDevNumber{layerMajor, layerMinor}
+	if minor, ok := fs.lowerDevMinors[orig]; ok {
+		return minor, nil
+	}
+	minor, err := fs.vfsfs.VirtualFilesystem().GetAnonBlockDevMinor()
+	if err != nil {
+		return 0, err
+	}
+	fs.lowerDevMinors[orig] = minor
+	return minor, nil
 }
 
 // dentry implements vfs.DentryImpl.
