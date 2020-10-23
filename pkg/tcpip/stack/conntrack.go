@@ -269,7 +269,7 @@ func (ct *ConnTrack) connForTID(tid tupleID) (*conn, direction) {
 	return nil, dirOriginal
 }
 
-func (ct *ConnTrack) insertRedirectConn(pkt *PacketBuffer, hook Hook, rt *RedirectTarget) *conn {
+func (ct *ConnTrack) insertRedirectConn(pkt *PacketBuffer, hook Hook, rt *RedirectTarget, address tcpip.Address) *conn {
 	tid, err := packetToTupleID(pkt)
 	if err != nil {
 		return nil
@@ -282,7 +282,7 @@ func (ct *ConnTrack) insertRedirectConn(pkt *PacketBuffer, hook Hook, rt *Redire
 	// rule. This tuple will be used to manipulate the packet in
 	// handlePacket.
 	replyTID := tid.reply()
-	replyTID.srcAddr = rt.Addr
+	replyTID.srcAddr = address
 	replyTID.srcPort = rt.Port
 	var manip manipType
 	switch hook {
